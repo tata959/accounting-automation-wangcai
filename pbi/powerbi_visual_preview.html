@@ -1,0 +1,119 @@
+
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>Power BI Visual Preview</title>
+      <style>
+        :root {
+          --bg:#f7f8fb;
+          --card:#ffffff;
+          --line:#e6e8ef;
+          --text:#1f2430;
+          --muted:#657085;
+          --accent:#f0b429;
+          --accent2:#f9d66a;
+        }
+        body { font-family: "Microsoft YaHei", Arial, sans-serif; margin: 0; background: var(--bg); color: var(--text); }
+        .wrap { max-width: 1200px; margin: 18px auto; padding: 0 14px; }
+        .hero {
+          background: linear-gradient(135deg, #f0b429 0%, #f8dc88 100%);
+          border-radius: 14px;
+          padding: 14px 16px;
+          color:#2f2507;
+          margin-bottom: 14px;
+        }
+        .hero h2 { margin:0; font-size: 22px; }
+        .hero p { margin:4px 0 0 0; font-size:13px; }
+        .section { background: var(--card); border:1px solid var(--line); border-radius: 12px; padding: 12px; margin-bottom: 12px; }
+        .section h3 { margin:0 0 8px 0; font-size:16px; }
+        .grid { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+        @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+        img { width:100%; border:1px solid #e8dfc8; border-radius: 10px; background:#fff; }
+        .table-wrap { width:100%; overflow-x:auto; }
+        table { border-collapse: collapse; width: 100%; min-width: 760px; background: #fff; table-layout: fixed; }
+        th, td { border: 1px solid #e6e8ef; padding: 6px 8px; font-size: 12px; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
+        th { background: #fff7df; }
+        .note { color: var(--muted); font-size: 12px; }
+      </style>
+    </head>
+    <body>
+      <div class="wrap">
+        <div class="hero">
+          <h2>CFO 现金流与营运资本看板（预览）</h2>
+          <p>生成时间：2026-04-17T18:36:05</p>
+        </div>
+
+        <div class="section">
+          <h3>KPI快照</h3>
+          <div class="table-wrap"><table class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>ticker</th>
+      <th>period_key</th>
+      <th>revenue</th>
+      <th>net_profit</th>
+      <th>revenue_mom_pct</th>
+      <th>dso</th>
+      <th>dio</th>
+      <th>dpo</th>
+      <th>ccc</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>IBM</td>
+      <td>2025-12</td>
+      <td>1.968600e+10</td>
+      <td>5600000000.0</td>
+      <td>0.2054</td>
+      <td>327.0464</td>
+      <td>58.8476</td>
+      <td>229.4093</td>
+      <td>156.4847</td>
+    </tr>
+    <tr>
+      <td>MANUAL</td>
+      <td>1970-01</td>
+      <td>5.854000e+03</td>
+      <td>0.0</td>
+      <td>0.0000</td>
+      <td>0.0000</td>
+      <td>NaN</td>
+      <td>NaN</td>
+      <td>NaN</td>
+    </tr>
+  </tbody>
+</table></div>
+        </div>
+
+        <div class="grid">
+          <div class="section">
+            <h3>营运资本效率：DSO / DIO / DPO / CCC</h3>
+            <img src="chart_wc_efficiency.png" alt="Working Capital" />
+          </div>
+          <div class="section">
+            <h3>应收账龄分析（堆叠柱形图）</h3>
+            <img src="chart_ar_aging_stacked.png" alt="AR Aging" />
+          </div>
+        </div>
+
+        <div class="grid">
+          <div class="section">
+            <h3>现金流构成瀑布图</h3>
+            <img src="chart_cashflow_waterfall.png" alt="Cashflow Waterfall" />
+          </div>
+          <div class="section">
+            <h3>FCF 趋势 + 净利润 + 经营现金流</h3>
+            <img src="chart_fcf_profit_quality.png" alt="FCF Quality" />
+          </div>
+        </div>
+
+        <div class="section">
+          <h3>营收趋势分析图</h3>
+          <img src="chart_revenue_trend.png" alt="Revenue Trend" />
+          <p class="note">注：应收账龄基于当前账面应收与DSO的区间映射估算，用于管理预警，不替代明细账龄台账。</p>
+        </div>
+      </div>
+    </body>
+    </html>
+    
