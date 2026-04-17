@@ -1,0 +1,8 @@
+[2026-04-17T15:03:02] cmd=开始月度结账 result=OK detail=数据准备失败，已自动重试一次仍未成功。错误信息：File "D:\R2R_Automation\scripts\01_extract_clean_load.py", line 1
+    import json`r`nimport os`r`nimport sqlite3
+               ^
+SyntaxError: invalid syntax
+[2026-04-17T15:03:02] cmd=查看审批状态 result=OK detail=当前审批状态：待审批。请先完成审批，再输入“审批通过，更新看板”。
+[2026-04-17T15:03:55] cmd=审批通过，更新看板 result=OK detail=数据已发布到看板。流程完成：已处理 5865 条财务记录，最新收入环比 20.54%。 已检测到收入波动超过 10%，请重点复核。
+[2026-04-17T15:04:02] cmd=开始月度结账 result=OK detail=流程完成：已处理 5865 条财务记录，最新收入环比 20.54%。
+[2026-04-17T15:04:42] cmd=开始月度结账 result=OK detail=账务数据已准备完成。 已生成初步报表（Financial_Report_2026_04.xlsx）。当前为待审批，请审批后输入“审批通过，更新看板”。
