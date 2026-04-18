@@ -1,24 +1,27 @@
-﻿import argparse
+import argparse
+import json
 import os
 import re
 import sqlite3
 import subprocess
 import sys
+import threading
 from datetime import datetime
+from difflib import get_close_matches
 from pathlib import Path
 from typing import Tuple
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import requests
 
-BASE_DIR = Path(os.getenv("R2R_BASE_DIR", r"D:\R2R_Automation"))
+BASE_DIR = Path(os.getenv("R2R_BASE_DIR", Path(__file__).resolve().parent))
 SCRIPTS_DIR = BASE_DIR / "scripts"
 PBI_DIR = BASE_DIR / "pbi"
 REPORT_DIR = BASE_DIR / "reports"
 STAGE_DIR = BASE_DIR / "data_stage"
 RAW_DIR = BASE_DIR / "data_raw"
 DB_PATH = BASE_DIR / "data_mart" / "r2r_finance.db"
-STATUS_FILE = PBI_DIR / "status.txt"
 ACTION_LOG = BASE_DIR / "logs" / "commander_actions.log"
 SCHEMA_SQL = SCRIPTS_DIR / "schema_star.sql"
 
@@ -34,6 +37,43 @@ REQUIRED_IMPORT_COLS = {
     "fiscal_date",
     "account_name",
     "amount",
+}
+
+STANDARD_ACCOUNT_MAP = {
+    "营业收入": "totalRevenue",
+    "主营业务收入": "totalRevenue",
+    "销售收入": "totalRevenue",
+    "revenue": "totalRevenue",
+    "sales": "totalRevenue",
+    "totalrevenue": "totalRevenue",
+    "销售费用": "sellingGeneralAndAdministrative",
+    "销售及管理费用": "sellingGeneralAndAdministrative",
+    "sellingexpense": "sellingGeneralAndAdministrative",
+    "sellinggeneralandadministrative": "sellingGeneralAndAdministrative",
+    "营业成本": "costOfRevenue",
+    "成本": "costOfRevenue",
+    "costofrevenue": "costOfRevenue",
+    "毛利润": "grossProfit",
+    "grossprofit": "grossProfit",
+    "净利润": "netIncome",
+    "netincome": "netIncome",
+    "营业费用": "operatingExpenses",
+    "operatingexpense": "operatingExpenses",
+    "operatingexpenses": "operatingExpenses",
+}
+
+_BATCH_LOCK = threading.Lock()
+_STAGED_BATCHES: list[pd.DataFrame] = []
+_STAGED_SOURCES: list[str] = []
+_IMPORT_CONFIRMED = False
+
+_RUNTIME_PARAMS = {
+    "last_year_avg_growth": 0.03,
+    "expected_growth": 0.03,
+    "budget_amount": "",
+    "threshold_val": 10.0,
+    "weight_totalRevenue": 1.0,
+    "weight_sellingGeneralAndAdministrative": 1.0,
 }
 
 
@@ -52,13 +92,73 @@ def log_action(command: str, result: str, detail: str) -> None:
         ACTION_LOG.write_text(line, encoding="utf-8")
 
 
+def _sanitize_float(value, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def set_runtime_params(params: dict) -> dict:
+    if not isinstance(params, dict):
+        return get_runtime_params()
+
+    _RUNTIME_PARAMS["last_year_avg_growth"] = _sanitize_float(
+        params.get("last_year_avg_growth", _RUNTIME_PARAMS["last_year_avg_growth"]),
+        _RUNTIME_PARAMS["last_year_avg_growth"],
+    )
+    _RUNTIME_PARAMS["expected_growth"] = _sanitize_float(
+        params.get("expected_growth", _RUNTIME_PARAMS["expected_growth"]),
+        _RUNTIME_PARAMS["expected_growth"],
+    )
+    _RUNTIME_PARAMS["threshold_val"] = _sanitize_float(
+        params.get("threshold_val", _RUNTIME_PARAMS["threshold_val"]),
+        _RUNTIME_PARAMS["threshold_val"],
+    )
+    _RUNTIME_PARAMS["weight_totalRevenue"] = _sanitize_float(
+        params.get("weight_totalRevenue", _RUNTIME_PARAMS["weight_totalRevenue"]),
+        _RUNTIME_PARAMS["weight_totalRevenue"],
+    )
+    _RUNTIME_PARAMS["weight_sellingGeneralAndAdministrative"] = _sanitize_float(
+        params.get(
+            "weight_sellingGeneralAndAdministrative",
+            _RUNTIME_PARAMS["weight_sellingGeneralAndAdministrative"],
+        ),
+        _RUNTIME_PARAMS["weight_sellingGeneralAndAdministrative"],
+    )
+    budget_amount = str(params.get("budget_amount", _RUNTIME_PARAMS["budget_amount"]) or "").strip()
+    _RUNTIME_PARAMS["budget_amount"] = budget_amount
+    return get_runtime_params()
+
+
+def get_runtime_params() -> dict:
+    return dict(_RUNTIME_PARAMS)
+
+
+def _runtime_env_overrides(extra: dict | None = None) -> dict:
+    weights = {
+        "totalRevenue": _RUNTIME_PARAMS["weight_totalRevenue"],
+        "sellingGeneralAndAdministrative": _RUNTIME_PARAMS["weight_sellingGeneralAndAdministrative"],
+    }
+    env = {
+        "R2R_LAST_YEAR_AVG_GROWTH": str(_RUNTIME_PARAMS["last_year_avg_growth"]),
+        "R2R_EXPECTED_GROWTH": str(_RUNTIME_PARAMS["expected_growth"]),
+        "R2R_THRESHOLD_VAL": str(_RUNTIME_PARAMS["threshold_val"]),
+        "R2R_ACCOUNT_WEIGHTS": json.dumps(weights, ensure_ascii=False),
+    }
+    if _RUNTIME_PARAMS["budget_amount"]:
+        env["R2R_BUDGET_AMOUNT"] = str(_RUNTIME_PARAMS["budget_amount"])
+    if extra:
+        env.update(extra)
+    return env
+
+
 def run_script(script_path: Path, env_overrides: dict | None = None) -> Tuple[bool, str]:
     if not script_path.exists():
         return False, f"未找到脚本: {script_path.name}"
 
     run_env = os.environ.copy()
-    if env_overrides:
-        run_env.update(env_overrides)
+    run_env.update(_runtime_env_overrides(env_overrides))
 
     proc = subprocess.run(
         [sys.executable, str(script_path)],
@@ -80,28 +180,24 @@ def get_latest_report_path() -> Path | None:
 
 
 def get_status() -> dict:
-    file_status = "Pending"
-    if STATUS_FILE.exists():
-        file_status = STATUS_FILE.read_text(encoding="utf-8").strip() or "Pending"
-
     db_status = "Pending"
+    period_key = datetime.now().strftime("%Y-%m")
     if DB_PATH.exists():
         try:
             with sqlite3.connect(DB_PATH) as conn:
                 row = conn.execute(
-                    "SELECT status FROM workflow_status ORDER BY status_id DESC LIMIT 1"
+                    "SELECT period_key, status FROM workflow_status ORDER BY status_id DESC LIMIT 1"
                 ).fetchone()
-                if row and row[0]:
-                    db_status = row[0]
+                if row:
+                    period_key, db_status = row[0], (row[1] or "Pending")
         except Exception:
             pass
 
-    approved = file_status.lower() == "approved" or db_status.lower() == "approved"
-    effective = "Approved" if approved else "Pending"
+    effective = "Approved" if str(db_status).lower() == "approved" else "Pending"
     return {
-        "file_status": file_status,
         "db_status": db_status,
         "effective": effective,
+        "period_key": period_key,
     }
 
 
@@ -140,9 +236,27 @@ def _create_schema_if_needed(conn: sqlite3.Connection) -> None:
             CREATE TABLE IF NOT EXISTS dim_account (account_id INTEGER PRIMARY KEY AUTOINCREMENT, account_name TEXT UNIQUE NOT NULL);
             CREATE TABLE IF NOT EXISTS fact_financials (fact_id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER NOT NULL, date_id INTEGER NOT NULL, statement_id INTEGER NOT NULL, account_id INTEGER NOT NULL, report_level TEXT NOT NULL, amount REAL NOT NULL, source_system TEXT, load_time TEXT, UNIQUE(company_id, date_id, statement_id, account_id, report_level));
             CREATE TABLE IF NOT EXISTS workflow_status (status_id INTEGER PRIMARY KEY AUTOINCREMENT, period_key TEXT NOT NULL, status TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, comments TEXT);
+            CREATE TABLE IF NOT EXISTS pbi_refresh_log (refresh_id INTEGER PRIMARY KEY AUTOINCREMENT, period_key TEXT NOT NULL, trigger_source TEXT NOT NULL, status TEXT NOT NULL, message TEXT, refreshed_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS run_log (run_id INTEGER PRIMARY KEY AUTOINCREMENT, node_name TEXT NOT NULL, result TEXT NOT NULL, message TEXT, created_at TEXT NOT NULL);
             """
         )
+
+
+def _normalize_account_name(account_name: str) -> str:
+    raw = str(account_name or "").strip()
+    if not raw:
+        return "totalRevenue"
+
+    key = re.sub(r"[\s_\-（）()]+", "", raw).lower()
+    if key in STANDARD_ACCOUNT_MAP:
+        return STANDARD_ACCOUNT_MAP[key]
+
+    candidates = list(STANDARD_ACCOUNT_MAP.keys())
+    matched = get_close_matches(key, candidates, n=1, cutoff=0.72)
+    if matched:
+        return STANDARD_ACCOUNT_MAP[matched[0]]
+
+    return raw
 
 
 def _normalize_general_dataframe(df: pd.DataFrame, source_name: str, default_ticker: str = "MANUAL") -> pd.DataFrame:
@@ -157,8 +271,8 @@ def _normalize_general_dataframe(df: pd.DataFrame, source_name: str, default_tic
                 return c
         return None
 
-    date_col = pick(["fiscal_date", "date", "month", "period", "日期", "月份", "期间", "会计期间"])
-    amount_col = pick(["amount", "revenue", "sales", "income", "金额", "收入", "值", "数值"])
+    date_col = pick(["fiscal_date", "date", "timestamp", "month", "period", "日期", "月份", "期间", "会计期间"])
+    amount_col = pick(["amount", "revenue", "sales", "income", "close", "price", "金额", "收入", "值", "数值"])
     account_col = pick(["account", "item", "科目", "项目", "指标"])
     ticker_col = pick(["ticker", "symbol", "股票", "代码"])
 
@@ -172,8 +286,18 @@ def _normalize_general_dataframe(df: pd.DataFrame, source_name: str, default_tic
     if date_col is None or amount_col is None:
         return pd.DataFrame(columns=list(REQUIRED_IMPORT_COLS) + ["currency"])
 
+    inferred_ticker = str(default_ticker)
+    if not ticker_col and source_name.startswith(("URL:", "API:")):
+        try:
+            parsed = urlparse(source_name.split(":", 1)[1])
+            symbol = (parse_qs(parsed.query).get("symbol", [""])[0] or "").strip().upper()
+            if symbol:
+                inferred_ticker = symbol
+        except Exception:
+            pass
+
     out = pd.DataFrame(index=work.index)
-    out["ticker"] = work[ticker_col].astype(str) if ticker_col else str(default_ticker)
+    out["ticker"] = work[ticker_col].astype(str) if ticker_col else inferred_ticker
     out["statement_type"] = "income_statement"
     out["report_level"] = "quarterly"
     out["fiscal_date"] = pd.to_datetime(work[date_col], errors="coerce")
@@ -185,6 +309,7 @@ def _normalize_general_dataframe(df: pd.DataFrame, source_name: str, default_tic
     if out.empty:
         return out
 
+    out["account_name"] = out["account_name"].map(_normalize_account_name)
     out["source_system"] = source_name
     out["load_time"] = datetime.now().isoformat(timespec="seconds")
     return out
@@ -206,6 +331,8 @@ def _load_dataframe_to_db(df: pd.DataFrame, source_name: str) -> Tuple[bool, str
     if work.empty:
         return False, "导入后无有效数据，请检查文件内容。"
 
+    work["account_name"] = work["account_name"].map(_normalize_account_name)
+
     if "currency" not in work.columns:
         work["currency"] = "USD"
     work["currency"] = work["currency"].fillna("USD")
@@ -220,86 +347,90 @@ def _load_dataframe_to_db(df: pd.DataFrame, source_name: str) -> Tuple[bool, str
     with sqlite3.connect(DB_PATH) as conn:
         _create_schema_if_needed(conn)
         cur = conn.cursor()
+        conn.execute("BEGIN")
+        try:
+            for ticker, grp in work.groupby("ticker"):
+                currency = grp["currency"].mode().iat[0] if not grp["currency"].mode().empty else "USD"
+                cur.execute(
+                    "INSERT OR IGNORE INTO dim_company (ticker, company_name, currency) VALUES (?, ?, ?)",
+                    (str(ticker), str(ticker), str(currency)),
+                )
 
-        for ticker, grp in work.groupby("ticker"):
-            currency = grp["currency"].mode().iat[0] if not grp["currency"].mode().empty else "USD"
+            for st in sorted(work["statement_type"].astype(str).unique()):
+                cur.execute("INSERT OR IGNORE INTO dim_statement (statement_type) VALUES (?)", (st,))
+
+            for acc in sorted(work["account_name"].astype(str).unique()):
+                cur.execute("INSERT OR IGNORE INTO dim_account (account_name) VALUES (?)", (acc,))
+
+            date_df = work[["fiscal_date"]].drop_duplicates().copy()
+            date_df["fiscal_year"] = date_df["fiscal_date"].dt.year
+            date_df["fiscal_month"] = date_df["fiscal_date"].dt.month
+            date_df["fiscal_quarter"] = ((date_df["fiscal_month"] - 1) // 3) + 1
+            date_df["period_key"] = date_df["fiscal_date"].dt.strftime("%Y-%m")
+
+            for _, r in date_df.iterrows():
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO dim_date (fiscal_date, fiscal_year, fiscal_quarter, fiscal_month, period_key)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        r["fiscal_date"].strftime("%Y-%m-%d"),
+                        int(r["fiscal_year"]),
+                        int(r["fiscal_quarter"]),
+                        int(r["fiscal_month"]),
+                        r["period_key"],
+                    ),
+                )
+
+            company_map = dict(cur.execute("SELECT ticker, company_id FROM dim_company").fetchall())
+            statement_map = dict(cur.execute("SELECT statement_type, statement_id FROM dim_statement").fetchall())
+            account_map = dict(cur.execute("SELECT account_name, account_id FROM dim_account").fetchall())
+            date_map = dict(cur.execute("SELECT fiscal_date, date_id FROM dim_date").fetchall())
+
+            insert_sql = """
+            INSERT OR REPLACE INTO fact_financials
+            (company_id, date_id, statement_id, account_id, report_level, amount, source_system, load_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """
+
+            recs = []
+            for _, r in work.iterrows():
+                dkey = r["fiscal_date"].strftime("%Y-%m-%d")
+                recs.append(
+                    (
+                        company_map[str(r["ticker"])],
+                        date_map[dkey],
+                        statement_map[str(r["statement_type"])],
+                        account_map[str(r["account_name"])],
+                        str(r["report_level"]),
+                        float(r["amount"]),
+                        str(r["source_system"]),
+                        str(r["load_time"]),
+                    )
+                )
+
+            cur.executemany(insert_sql, recs)
             cur.execute(
-                "INSERT OR IGNORE INTO dim_company (ticker, company_name, currency) VALUES (?, ?, ?)",
-                (str(ticker), str(ticker), str(currency)),
-            )
-
-        for st in sorted(work["statement_type"].astype(str).unique()):
-            cur.execute("INSERT OR IGNORE INTO dim_statement (statement_type) VALUES (?)", (st,))
-
-        for acc in sorted(work["account_name"].astype(str).unique()):
-            cur.execute("INSERT OR IGNORE INTO dim_account (account_name) VALUES (?)", (acc,))
-
-        date_df = work[["fiscal_date"]].drop_duplicates().copy()
-        date_df["fiscal_year"] = date_df["fiscal_date"].dt.year
-        date_df["fiscal_month"] = date_df["fiscal_date"].dt.month
-        date_df["fiscal_quarter"] = ((date_df["fiscal_month"] - 1) // 3) + 1
-        date_df["period_key"] = date_df["fiscal_date"].dt.strftime("%Y-%m")
-
-        for _, r in date_df.iterrows():
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO dim_date (fiscal_date, fiscal_year, fiscal_quarter, fiscal_month, period_key)
-                VALUES (?, ?, ?, ?, ?)
-                """,
+                "INSERT INTO run_log (node_name, result, message, created_at) VALUES (?, ?, ?, ?)",
                 (
-                    r["fiscal_date"].strftime("%Y-%m-%d"),
-                    int(r["fiscal_year"]),
-                    int(r["fiscal_quarter"]),
-                    int(r["fiscal_month"]),
-                    r["period_key"],
+                    "Manual_Import",
+                    "SUCCESS",
+                    f"Imported {len(work)} rows from {source_name}",
+                    datetime.now().isoformat(timespec="seconds"),
                 ),
             )
-
-        company_map = dict(cur.execute("SELECT ticker, company_id FROM dim_company").fetchall())
-        statement_map = dict(cur.execute("SELECT statement_type, statement_id FROM dim_statement").fetchall())
-        account_map = dict(cur.execute("SELECT account_name, account_id FROM dim_account").fetchall())
-        date_map = dict(cur.execute("SELECT fiscal_date, date_id FROM dim_date").fetchall())
-
-        insert_sql = """
-        INSERT OR REPLACE INTO fact_financials
-        (company_id, date_id, statement_id, account_id, report_level, amount, source_system, load_time)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """
-
-        recs = []
-        for _, r in work.iterrows():
-            dkey = r["fiscal_date"].strftime("%Y-%m-%d")
-            recs.append(
-                (
-                    company_map[str(r["ticker"])],
-                    date_map[dkey],
-                    statement_map[str(r["statement_type"])],
-                    account_map[str(r["account_name"])],
-                    str(r["report_level"]),
-                    float(r["amount"]),
-                    str(r["source_system"]),
-                    str(r["load_time"]),
-                )
-            )
-
-        cur.executemany(insert_sql, recs)
-        cur.execute(
-            "INSERT INTO run_log (node_name, result, message, created_at) VALUES (?, ?, ?, ?)",
-            (
-                "Manual_Import",
-                "SUCCESS",
-                f"Imported {len(work)} rows from {source_name}",
-                datetime.now().isoformat(timespec="seconds"),
-            ),
-        )
-        conn.commit()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     return True, f"导入成功：共 {len(work)} 条记录，已更新到账务数据。"
 
 
-def import_csv_file(file_path: Path) -> Tuple[bool, str]:
+def _read_input_file(file_path: Path) -> tuple[bool, pd.DataFrame | None, str]:
     if not file_path.exists():
-        return False, f"未找到文件：{file_path}"
+        return False, None, f"未找到文件：{file_path}"
 
     try:
         if file_path.suffix.lower() in [".xlsx", ".xls"]:
@@ -307,9 +438,102 @@ def import_csv_file(file_path: Path) -> Tuple[bool, str]:
         else:
             df = pd.read_csv(file_path)
     except Exception as e:
-        return False, f"文件读取失败：{e}"
+        return False, None, f"文件读取失败：{e}"
+    return True, df, "OK"
 
-    return _load_dataframe_to_db(df, source_name=f"ManualFile:{file_path.name}")
+
+def stage_dataframe(df: pd.DataFrame, source_name: str) -> Tuple[bool, str]:
+    global _IMPORT_CONFIRMED
+    normalized = _normalize_general_dataframe(df, source_name=source_name)
+    if normalized.empty and REQUIRED_IMPORT_COLS.issubset(set(df.columns)):
+        normalized = df.copy()
+        normalized["fiscal_date"] = pd.to_datetime(normalized["fiscal_date"], errors="coerce")
+        normalized["amount"] = pd.to_numeric(normalized["amount"], errors="coerce")
+        normalized = normalized.dropna(subset=["fiscal_date", "amount"])
+        normalized["account_name"] = normalized["account_name"].map(_normalize_account_name)
+
+    if normalized.empty:
+        return False, "暂存失败：无法识别有效日期/金额列。"
+
+    with _BATCH_LOCK:
+        _STAGED_BATCHES.append(normalized)
+        _STAGED_SOURCES.append(source_name)
+        _IMPORT_CONFIRMED = False
+        total_rows = sum(len(x) for x in _STAGED_BATCHES)
+        batch_cnt = len(_STAGED_BATCHES)
+    return True, f"已暂存成功：第 {batch_cnt} 批，当前累计 {total_rows} 行。"
+
+
+def stage_import_file(file_path: Path) -> Tuple[bool, str]:
+    ok, df, msg = _read_input_file(file_path)
+    if not ok or df is None:
+        return False, msg
+    return stage_dataframe(df, source_name=f"Staged:{file_path.name}")
+
+
+def get_staged_summary() -> dict:
+    with _BATCH_LOCK:
+        return {
+            "batch_count": len(_STAGED_BATCHES),
+            "row_count": int(sum(len(x) for x in _STAGED_BATCHES)),
+            "sources": list(_STAGED_SOURCES),
+            "confirmed": bool(_IMPORT_CONFIRMED),
+        }
+
+
+def reset_staged_imports() -> None:
+    global _IMPORT_CONFIRMED
+    with _BATCH_LOCK:
+        _STAGED_BATCHES.clear()
+        _STAGED_SOURCES.clear()
+        _IMPORT_CONFIRMED = False
+
+
+def confirm_staged_import() -> Tuple[bool, str]:
+    global _IMPORT_CONFIRMED
+    with _BATCH_LOCK:
+        if not _STAGED_BATCHES:
+            return False, "暂无可确认批次，请先上传文件。"
+        merged = pd.concat(_STAGED_BATCHES, ignore_index=True)
+        sources = list(_STAGED_SOURCES)
+
+    ok, msg = _load_dataframe_to_db(merged, source_name=f"BatchConfirm:{'|'.join(sources)}")
+    if not ok:
+        return False, msg
+
+    with _BATCH_LOCK:
+        _STAGED_BATCHES.clear()
+        _STAGED_SOURCES.clear()
+        _IMPORT_CONFIRMED = True
+
+    return True, f"{msg} 已完成批次确认并锁定流程。"
+
+
+def _has_fact_data() -> bool:
+    if not DB_PATH.exists():
+        return False
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM fact_financials").fetchone()
+            return bool(row and int(row[0]) > 0)
+    except Exception:
+        return False
+
+
+def _is_flow_unlocked() -> bool:
+    return _IMPORT_CONFIRMED or _has_fact_data()
+
+
+def import_csv_file(file_path: Path) -> Tuple[bool, str]:
+    ok, df, msg = _read_input_file(file_path)
+    if not ok or df is None:
+        return False, msg
+
+    ret = _load_dataframe_to_db(df, source_name=f"ManualFile:{file_path.name}")
+    if ret[0]:
+        global _IMPORT_CONFIRMED
+        _IMPORT_CONFIRMED = True
+    return ret
 
 
 def import_csv_from_url(url: str) -> Tuple[bool, str]:
@@ -330,9 +554,9 @@ def import_csv_from_url(url: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"URL 数据不是可识别的 CSV：{e}"
 
-    ok, msg = _load_dataframe_to_db(df, source_name=f"URL:{url}")
+    ok, msg = stage_dataframe(df, source_name=f"URL:{url}")
     if ok:
-        return True, f"{msg} 来源文件：{out_file}"
+        return True, f"{msg} 来源文件：{out_file}。请点击“确认完成导入”后入库。"
     return False, msg
 
 
@@ -359,8 +583,10 @@ def import_json_from_api_url(url: str) -> Tuple[bool, str]:
     if df.empty:
         return False, "JSON 中没有可导入的数据行。"
 
-    ok, msg = _load_dataframe_to_db(df, source_name=f"API:{url}")
-    return (ok, msg)
+    ok, msg = stage_dataframe(df, source_name=f"API:{url}")
+    if ok:
+        return True, f"{msg} 请点击“确认完成导入”后入库。"
+    return False, msg
 
 
 def run_extract_for_ticker(ticker: str) -> Tuple[bool, str]:
@@ -370,6 +596,8 @@ def run_extract_for_ticker(ticker: str) -> Tuple[bool, str]:
 
     ok, msg = run_script(SCRIPT_01, env_overrides={"R2R_TICKERS": t})
     if ok:
+        global _IMPORT_CONFIRMED
+        _IMPORT_CONFIRMED = True
         return True, f"云端取数完成：已按股票代码 {t} 更新账务数据。"
     return False, f"股票代码 {t} 取数失败：{msg[:260]}"
 
@@ -380,24 +608,29 @@ def cloud_ingest(input_text: str) -> Tuple[bool, str]:
         return False, "请输入股票代码、ERP账套名称或API地址。"
 
     if re.match(r"^https?://", text, flags=re.IGNORECASE):
+        lower_text = text.lower()
+        if "datatype=csv" in lower_text or lower_text.endswith(".csv"):
+            ok_csv, msg_csv = import_csv_from_url(text)
+            if ok_csv:
+                return ok_csv, f"云端 URL CSV 已进入暂存池。{msg_csv}"
+            return False, f"URL CSV 导入失败：{msg_csv}"
+
         if text.lower().endswith(".json"):
             return import_json_from_api_url(text)
 
-        # 优先尝试 JSON，失败再尝试 CSV
         ok_json, msg_json = import_json_from_api_url(text)
         if ok_json:
-            return ok_json, f"云端 API JSON 导入成功。{msg_json}"
+            return ok_json, f"云端 API JSON 已进入暂存池。{msg_json}"
 
         ok_csv, msg_csv = import_csv_from_url(text)
         if ok_csv:
-            return ok_csv, f"云端 URL CSV 导入成功。{msg_csv}"
+            return ok_csv, f"云端 URL CSV 已进入暂存池。{msg_csv}"
 
         return False, f"URL 导入失败：JSON尝试({msg_json})；CSV尝试({msg_csv})"
 
     if re.fullmatch(r"[A-Za-z.\-]{1,10}", text):
         return run_extract_for_ticker(text)
 
-    # ERP账套名称：当前做轻量映射入口提示
     return False, f"已识别 ERP账套名称“{text}”。请上传该账套导出的 CSV/Excel，或提供可访问 API 地址。"
 
 
@@ -414,7 +647,7 @@ def suggest_mapping(columns: list[str]) -> dict:
     return {
         "fiscal_date": pick(["date", "month", "period", "日期", "月份", "期间"]),
         "amount": pick(["sales", "revenue", "amount", "收入", "金额", "值"]),
-        "account_name": pick(["account", "item", "科目", "项目", "指标"]),
+        "account_name": pick(["account", "item", "科目", "项目", "指标", "费用"]),
         "ticker": pick(["ticker", "symbol", "股票", "代码"]),
     }
 
@@ -435,6 +668,8 @@ def standardize_with_mapping(df: pd.DataFrame, mapping: dict, default_ticker: st
     out["currency"] = "USD"
 
     out = out.dropna(subset=["fiscal_date", "amount"])
+    if not out.empty:
+        out["account_name"] = out["account_name"].map(_normalize_account_name)
     return out
 
 
@@ -450,7 +685,27 @@ def run_data_with_repair() -> Tuple[bool, str]:
     return False, f"数据准备失败，已自动重试一次仍未成功。错误信息：{retry_msg[:280]}"
 
 
+def confirm_approval(updated_by: str = "web_ui", comments: str = "Approved by web action") -> Tuple[bool, str]:
+    ensure_dirs()
+    period_key = datetime.now().strftime("%Y-%m")
+    with sqlite3.connect(DB_PATH) as conn:
+        _create_schema_if_needed(conn)
+        conn.execute(
+            "INSERT INTO workflow_status (period_key, status, updated_at, updated_by, comments) VALUES (?, ?, ?, ?, ?)",
+            (period_key, "Approved", datetime.now().isoformat(timespec="seconds"), updated_by, comments),
+        )
+        conn.execute(
+            "INSERT INTO run_log (node_name, result, message, created_at) VALUES (?, ?, ?, ?)",
+            ("Approval_Signal_API", "SUCCESS", "workflow_status set to Approved by API", datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+    return True, "审批状态已更新为 Approved。"
+
+
 def handle_start_close() -> str:
+    if not _is_flow_unlocked():
+        return "流程已锁定：请先上传并点击“确认完成导入”。"
+
     ok, prep_msg = run_data_with_repair()
     if not ok:
         return prep_msg
@@ -478,6 +733,9 @@ def handle_status() -> str:
 
 
 def handle_generate_report() -> str:
+    if not _is_flow_unlocked():
+        return "流程已锁定：请先上传并点击“确认完成导入”。"
+
     ok, msg = run_script(SCRIPT_02)
     if not ok:
         return f"报表生成失败：{msg[:260]}"
@@ -487,7 +745,10 @@ def handle_generate_report() -> str:
 
 
 def handle_publish() -> str:
-    ok_sig, msg_sig = run_script(SCRIPT_04)
+    if not _is_flow_unlocked():
+        return "流程已锁定：请先上传并点击“确认完成导入”。"
+
+    ok_sig, msg_sig = confirm_approval(updated_by="web_button", comments="Approved by publish action")
     if not ok_sig:
         return f"审批信号设置失败：{msg_sig[:240]}"
 
@@ -498,10 +759,13 @@ def handle_publish() -> str:
     summary = summarize_result()
     alert_text = ""
     dataset = PBI_DIR / "pbi_dataset.csv"
+    threshold = _sanitize_float(_RUNTIME_PARAMS.get("threshold_val", 10.0), 10.0) / 100.0
     if dataset.exists():
         df = pd.read_csv(dataset)
-        if "alert_flag" in df.columns and df["alert_flag"].fillna(False).any():
-            alert_text = " 已检测到收入波动超过 10%，请重点复核。"
+        if "revenue_mom_pct" in df.columns:
+            hit = pd.to_numeric(df["revenue_mom_pct"], errors="coerce").abs() > threshold
+            if hit.fillna(False).any():
+                alert_text = f" 已检测到收入波动超过 {threshold * 100:.0f}%，请重点复核。"
 
     return f"数据已发布到看板。{summary}{alert_text}"
 
