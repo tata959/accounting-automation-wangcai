@@ -1,4 +1,5 @@
-﻿import html
+import html
+import json
 import mimetypes
 import os
 import re
@@ -8,44 +9,47 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 
 from finance_commander import (
     PBI_DIR,
-    REQUIRED_IMPORT_COLS,
     RAW_DIR,
     cloud_ingest,
+    confirm_staged_import,
     get_latest_report_path,
+    get_runtime_params,
+    get_staged_summary,
     get_status,
-    import_csv_file,
     route_command,
+    set_runtime_params,
+    stage_dataframe,
     standardize_with_mapping,
     suggest_mapping,
 )
 
 HOST = os.getenv("R2R_HOST", ("0.0.0.0" if os.getenv("PORT") else "127.0.0.1"))
 PORT = int(os.getenv("PORT", os.getenv("R2R_PORT", "8787")))
-BASE_DIR = Path(os.getenv("R2R_BASE_DIR", r"D:\R2R_Automation"))
+BASE_DIR = Path(os.getenv("R2R_BASE_DIR", Path(__file__).resolve().parent))
 UPLOAD_DIR = RAW_DIR / "web_uploads"
 PENDING_DIR = RAW_DIR / "pending_mapping"
 ASSET_DIR = BASE_DIR / "assets"
 
 ACTION_MAP = {
     "start_close": "开始月度结账",
-    "check_status": "查看审批状态",
     "generate_report": "生成本月初步报表",
+    "check_status": "查看审批状态",
     "publish": "审批通过，更新看板",
 }
 
-LAST_RESULT = "欢迎来到旺财。请先导入数据，或直接点击“开始月度结账”。"
+LAST_RESULT = "欢迎来到旺财。请先导入数据，上传可分多批次，完成后点击“确认完成导入”。"
 LAST_COMMAND = ""
 LAST_TIME = ""
 PENDING_CONFIRM: dict = {}
 
 
-def get_alert_summary() -> tuple[bool, str]:
+def get_alert_summary(threshold_val: float) -> tuple[bool, str]:
     ds = PBI_DIR / "pbi_dataset.csv"
     if not ds.exists():
         return False, "暂无预警数据"
@@ -54,13 +58,21 @@ def get_alert_summary() -> tuple[bool, str]:
     except Exception:
         return False, "预警数据读取失败"
 
-    if "alert_flag" not in df.columns:
-        return False, "未检测到预警字段"
+    if "revenue_mom_pct" not in df.columns:
+        return False, "未检测到收入环比字段"
 
-    hit = df["alert_flag"].fillna(False).astype(bool)
-    if hit.any():
-        return True, "发现波动超过10%的指标"
-    return False, "当前未触发波动预警"
+    threshold = float(threshold_val) / 100.0
+    mom = pd.to_numeric(df["revenue_mom_pct"], errors="coerce").dropna()
+    if mom.empty:
+        return False, "暂无可计算的收入环比"
+
+    diff = mom.abs() - threshold
+    if (diff > 0).any():
+        max_hit = float(mom.abs().max() * 100)
+        return True, f"发现波动 {max_hit:.2f}% 超过阈值 {threshold_val:.2f}%"
+
+    latest = float(mom.iloc[-1] * 100)
+    return False, f"当前未触发预警（最新环比 {latest:.2f}%）"
 
 
 def parse_multipart(body: bytes, content_type: str):
@@ -127,7 +139,7 @@ def _confirm_panel(columns: list[str], sugg: dict, token: str) -> str:
         <input type="hidden" name="{name}_suggest" value="{html.escape(selected or '')}" />
         """
 
-    msg = f"我识别到你的‘月份/日期’可能在【{sugg.get('fiscal_date') or '未识别'}】列，‘销售收入/金额’可能在【{sugg.get('amount') or '未识别'}】列。请确认后导入。"
+    msg = f"我识别到你的‘月份/日期’可能在【{sugg.get('fiscal_date') or '未识别'}】列，‘销售收入/金额’可能在【{sugg.get('amount') or '未识别'}】列。请确认后加入暂存区。"
 
     return f"""
     <div class=\"glass card col-12\">
@@ -142,17 +154,19 @@ def _confirm_panel(columns: list[str], sugg: dict, token: str) -> str:
         <label>默认股票代码（无对应列时使用）</label>
         <input type=\"text\" name=\"default_ticker\" value=\"MANUAL\" />
         <div style=\"display:flex; gap:8px; margin-top:8px;\">
-          <button class=\"btn\" type=\"submit\" name=\"decision\" value=\"confirm\">确认并导入</button>
+          <button class=\"btn\" type=\"submit\" name=\"decision\" value=\"confirm\">确认并加入暂存</button>
           <button class=\"btn btn-secondary\" type=\"submit\" name=\"decision\" value=\"cancel\">取消</button>
         </div>
       </form>
     </div>
     """
 
-
 def render_page() -> str:
+    params = get_runtime_params()
+    threshold_val = float(params.get("threshold_val", 10.0))
     status = get_status()
-    has_alert, alert_msg = get_alert_summary()
+    staged = get_staged_summary()
+    has_alert, alert_msg = get_alert_summary(threshold_val)
     latest_report = get_latest_report_path()
     report_path = str(latest_report) if latest_report else "暂无"
     pbi_pbids = PBI_DIR / "R2R_Local_Dataset.pbids"
@@ -183,21 +197,11 @@ def render_page() -> str:
             PENDING_CONFIRM.get("token", ""),
         )
 
-    path_link = "#"
-    folder_link = "#"
-    preview_link = "#"
-    if latest_report:
-        path_link = "/preview-report"
-        folder_link = "/open-report-folder"
-        preview_link = "/preview-report"
+    path_link = "/preview-report" if latest_report else "#"
+    folder_link = "/open-report-folder" if latest_report else "#"
 
-    pbi_link = "#"
-    pbi_folder_link = "#"
-    pbi_preview_link = "#"
-    if pbi_path_obj:
-        pbi_link = "/preview-powerbi"
-        pbi_folder_link = "/open-pbi-folder"
-        pbi_preview_link = "/preview-powerbi"
+    pbi_link = "/preview-powerbi" if pbi_path_obj else "#"
+    pbi_folder_link = "/open-pbi-folder" if pbi_path_obj else "#"
 
     return f"""
 <!doctype html>
@@ -257,9 +261,11 @@ def render_page() -> str:
       border:1px dashed #d5ba86; border-radius:8px; padding:6px 8px; background:#fffdf8;
     }}
     .path-link {{ color:var(--link); text-decoration:underline; font-weight:700; }}
-    .path-actions {{ display:flex; gap:10px; margin-top:6px; font-size:14px; }}
+    .path-actions {{ display:flex; gap:10px; margin-top:6px; font-size:14px; flex-wrap:wrap; }}
 
     .actions {{ display:grid; grid-template-columns: repeat(2, minmax(180px,1fr)); gap:10px; align-content:start; }}
+    .flow-card {{ display:flex; flex-direction:column; }}
+    .flow-note {{ margin-top:auto; padding-top:16px; }}
     .action-form button, .btn {{
       width:100%; border:none; border-radius:12px; padding:11px; font-size:16px; font-weight:700;
       background:var(--primary); color:#fff; cursor:pointer;
@@ -277,7 +283,7 @@ def render_page() -> str:
     .map-grid label {{ font-size:13px; color:#6b5431; font-weight:700; }}
 
     .result {{
-      max-height:86px; overflow:auto; background:#fffdf8; border:1px dashed #d1b076; border-radius:10px;
+      max-height:120px; overflow:auto; background:#fffdf8; border:1px dashed #d1b076; border-radius:10px;
       padding:9px; line-height:1.35; font-size:14px;
     }}
     .meta {{ margin-top:6px; color:var(--muted); font-size:13px; }}
@@ -301,56 +307,105 @@ def render_page() -> str:
     </div>
 
     <div class="grid">
+      <div class="glass card col-12">
+        <h2>🧾 执行结果</h2>
+        <div class="result" style="color:{'#c62828' if has_alert else '#3b2a11'};">{html.escape(LAST_RESULT)}</div>
+        <div class="meta">最后动作：{html.escape(LAST_COMMAND or '-')} ｜ 执行时间：{html.escape(LAST_TIME or '-')}</div>
+      </div>
+
       <div class="glass card col-6 full-height">
         <h2>📌 当前状态</h2>
         <div class="kv">
           审批状态：<strong>{html.escape(status['db_status'])}</strong>
+          <div class="path-line">导入暂存：<strong>{staged['batch_count']} 批 / {staged['row_count']} 行</strong></div>
           <div class="path-line">初步报表路径：</div>
           <a class="path-link path-ellipsis" title="{html.escape(report_path)}" href="{path_link}">{html.escape(report_path)}</a>
           <div class="path-actions">
             <a class="path-link" href="{folder_link}">打开报表文件夹</a>
-            <a class="path-link" href="{preview_link}">网页预览Excel</a>
+            <a class="path-link" href="/preview-report?page=1">网页预览Excel</a>
           </div>
           <div class="path-line">看板可视化路径：</div>
           <a class="path-link path-ellipsis" title="{html.escape(pbi_path)}" href="{pbi_link}">{html.escape(pbi_path)}</a>
           <div class="path-actions">
             <a class="path-link" href="{pbi_folder_link}">打开看板文件夹</a>
-            <a class="path-link" href="{pbi_preview_link}">网页预览Power BI</a>
+            <a class="path-link" href="/preview-powerbi?page=1">网页预览Power BI</a>
           </div>
         </div>
       </div>
 
-      <div class="glass card col-6 full-height">
+      <div class="glass card col-6 full-height flow-card">
         <h2>⚡ 一键流程操作</h2>
-        <div class="actions">{buttons}</div>
-        <p class="footer-note">建议顺序：开始月度结账 → 查看审批状态 → 审批通过，更新看板</p>
+        <div class="desc-block">
+          推荐顺序：确认完成导入 → 开始月度结账 → 确认波动参数并计算 → 生成本月初步报表 → 查看审批状态 → 审批通过，更新看板
+        </div>
+        <div class="actions">
+          <form method="post" action="/confirm-import" class="action-form">
+            <button type="submit">① 确认完成导入</button>
+          </form>
+          <form method="post" action="/run" class="action-form">
+            <input type="hidden" name="action" value="start_close" />
+            <button type="submit">② 开始月度结账</button>
+          </form>
+          <form method="post" action="/api/v1/confirm_approval" class="action-form">
+            <input type="hidden" name="redirect" value="1" />
+            <button type="submit">③ 确认波动参数并计算</button>
+          </form>
+          <form method="post" action="/run" class="action-form">
+            <input type="hidden" name="action" value="generate_report" />
+            <button type="submit">④ 生成本月初步报表</button>
+          </form>
+          <form method="post" action="/run" class="action-form">
+            <input type="hidden" name="action" value="check_status" />
+            <button type="submit">⑤ 查看审批状态</button>
+          </form>
+          <form method="post" action="/run" class="action-form">
+            <input type="hidden" name="action" value="publish" />
+            <button type="submit">⑥ 审批通过，更新看板</button>
+          </form>
+        </div>
+        <p class="footer-note flow-note">请按上述 ① 到 ⑥ 顺序执行，状态结果会在上方“执行结果”实时回显。</p>
       </div>
 
       <div class="glass card col-6">
         <h2>一、云端取数</h2>
         <div class="desc-block">输入ERP 账套名称或 API 地址</div>
         <form method="post" action="/cloud-ingest" class="import-row">
-          <input type="text" name="cloud_input" placeholder="输入 IBM / ERP账套名 / https://api.example.com/data.json" required />
+          <input type="text" name="cloud_input" placeholder="输入 ERP账套名 / https://api.example.com/data.json" required />
           <button class="btn" type="submit">执行云端取数</button>
         </form>
       </div>
 
       <div class="glass card col-6">
         <h2>二、本地表单导入</h2>
-        <div class="desc-block">上传本地 Excel 或 CSV，系统会自动识别字段并请你确认</div>
+        <div class="desc-block">支持多批次上传 CSV/Excel，上传后仅进入暂存区，不直接入库</div>
         <form method="post" action="/local-import" enctype="multipart/form-data" class="import-row">
           <input type="file" name="file" accept=".csv,.xlsx,.xls" required />
-          <button class="btn" type="submit">上传并智能识别</button>
+          <button class="btn" type="submit">上传并加入暂存</button>
+        </form>
+      </div>
+
+      <div class="glass card col-12">
+        <h2>三、动态预算参数与预警阈值</h2>
+        <form method="post" action="/set-runtime-params" class="map-grid">
+          <label>去年平均增长率（默认参考，如 0.08）</label>
+          <input type="text" name="last_year_avg_growth" value="{html.escape(str(params['last_year_avg_growth']))}" />
+          <label>期望增长率（如 0.12）</label>
+          <input type="text" name="expected_growth" value="{html.escape(str(params['expected_growth']))}" />
+          <label>预算金额（可留空）</label>
+          <input type="text" name="budget_amount" value="{html.escape(str(params['budget_amount']))}" />
+          <label>波动阈值 threshold_val（百分数，如 15）</label>
+          <input type="text" name="threshold_val" value="{html.escape(str(params['threshold_val']))}" />
+          <label>营业收入权重（totalRevenue）</label>
+          <input type="text" name="weight_totalRevenue" value="{html.escape(str(params['weight_totalRevenue']))}" />
+          <label>销售费用权重（sellingGeneralAndAdministrative）</label>
+          <input type="text" name="weight_sellingGeneralAndAdministrative" value="{html.escape(str(params['weight_sellingGeneralAndAdministrative']))}" />
+          <div style="display:flex; gap:8px; margin-top:8px; grid-column: span 2;">
+            <button class="btn" type="submit">保存参数并实时生效</button>
+          </div>
         </form>
       </div>
 
       {confirm_html}
-
-      <div class="glass card col-12">
-        <h2>🧾 执行结果</h2>
-        <div class="result">{html.escape(LAST_RESULT)}</div>
-        <div class="meta">最后动作：{html.escape(LAST_COMMAND or "-")} ｜ 执行时间：{html.escape(LAST_TIME or "-")}</div>
-      </div>
     </div>
   </div>
 </body>
@@ -363,6 +418,15 @@ class CommanderHandler(BaseHTTPRequestHandler):
         data = body.encode("utf-8")
         self.send_response(status_code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_json(self, payload: dict, status_code: int = 200):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -382,15 +446,20 @@ class CommanderHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=60")
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self):
-        if self.path == "/":
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
+
+        if path == "/":
             self._send_html(render_page())
             return
 
-        if self.path == "/asset/hero_cat.jpg":
+        if path == "/asset/hero_cat.jpg":
             img = ASSET_DIR / "hero_cat.jpg"
             if not img.exists():
                 self.send_error(HTTPStatus.NOT_FOUND, "图片不存在")
@@ -400,7 +469,7 @@ class CommanderHandler(BaseHTTPRequestHandler):
             self._send_bytes(data, ctype or "image/jpeg")
             return
 
-        if self.path == "/open-report-folder":
+        if path == "/open-report-folder":
             report = get_latest_report_path()
             if not report:
                 self._set_result("打开报表文件夹", "未找到报表文件。")
@@ -417,7 +486,7 @@ class CommanderHandler(BaseHTTPRequestHandler):
             self._redirect("/")
             return
 
-        if self.path == "/open-pbi-folder":
+        if path == "/open-pbi-folder":
             pbi_pbids = PBI_DIR / "R2R_Local_Dataset.pbids"
             pbi_csv = PBI_DIR / "pbi_dataset.csv"
             target = pbi_pbids if pbi_pbids.exists() else (pbi_csv if pbi_csv.exists() else None)
@@ -436,22 +505,29 @@ class CommanderHandler(BaseHTTPRequestHandler):
             self._redirect("/")
             return
 
-        if self.path == "/preview-report":
+        if path == "/preview-report":
             report = get_latest_report_path()
             if not report or not report.exists():
                 self._send_html("<h3>未找到可预览的报表文件。</h3>")
                 return
             try:
+                page_no = int((query.get("page", ["1"])[0] or "1").strip())
+                page_no = max(1, page_no)
                 xls = pd.ExcelFile(report)
-                sections = []
-                for s in xls.sheet_names[:6]:
-                    df = pd.read_excel(report, sheet_name=s).head(50)
-                    for col in ["环比%", "同比%", "revenue_mom_pct", "yoy_pct", "mom_pct"]:
-                        if col in df.columns:
-                            df[col] = pd.to_numeric(df[col], errors="coerce").round(4)
-                    sections.append(
-                        f"<h3>{html.escape(s)}</h3>" + df.to_html(index=False, border=0, classes='tb')
-                    )
+                sheet_names = xls.sheet_names[:6]
+                sheet_index = min(page_no - 1, len(sheet_names) - 1)
+                sheet = sheet_names[sheet_index]
+                df = pd.read_excel(report, sheet_name=sheet).head(100)
+                for col in ["环比%", "同比%", "revenue_mom_pct", "yoy_pct", "mom_pct"]:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce").round(4)
+
+                nav = "".join(
+                    [
+                        f"<a href='/preview-report?page={idx + 1}' style='margin-right:8px;'>{html.escape(name)}</a>"
+                        for idx, name in enumerate(sheet_names)
+                    ]
+                )
                 page = f"""
                 <html><head><meta charset='utf-8'><title>报表预览</title>
                 <style>
@@ -463,7 +539,9 @@ class CommanderHandler(BaseHTTPRequestHandler):
                 </style></head><body>
                 <p><a href="/">返回旺财控制台</a></p>
                 <h2>Excel 报表预览：{html.escape(str(report.name))}</h2>
-                {''.join(sections)}
+                <div>{nav}</div>
+                <h3>{html.escape(sheet)}</h3>
+                {df.to_html(index=False, border=0, classes='tb')}
                 </body></html>
                 """
                 self._send_html(page)
@@ -471,38 +549,42 @@ class CommanderHandler(BaseHTTPRequestHandler):
                 self._send_html(f"<h3>预览失败：{html.escape(str(e))}</h3><p><a href='/'>返回</a></p>")
             return
 
-        if self.path == "/preview-powerbi":
-            pbi_pbids = PBI_DIR / "R2R_Local_Dataset.pbids"
-            pbi_csv = PBI_DIR / "pbi_dataset.csv"
+        if path == "/preview-powerbi":
             visual_html = PBI_DIR / "powerbi_visual_preview.html"
             if visual_html.exists():
                 try:
-                    self._send_html(visual_html.read_text(encoding="utf-8"))
+                    page = visual_html.read_text(encoding="utf-8")
+                    if "返回旺财控制台" not in page:
+                        if "<body>" in page:
+                            page = page.replace("<body>", "<body><p style='padding:12px 16px 0 16px;'><a href=\"/\">返回旺财控制台</a></p>", 1)
+                        else:
+                            page = f"<p><a href='/'>返回旺财控制台</a></p>{page}"
+                    self._send_html(page)
                     return
                 except Exception as e:
                     self._send_html(f"<h3>可视化页面读取失败：{html.escape(str(e))}</h3><p><a href='/'>返回</a></p>")
                     return
+
+            pbi_csv = PBI_DIR / "pbi_dataset.csv"
             if pbi_csv.exists():
                 try:
-                    df = pd.read_csv(pbi_csv).head(200)
-                    preferred_cols = [
-                        "ticker",
-                        "period_key",
-                        "revenue",
-                        "net_profit",
-                        "revenue_mom_pct",
-                        "dso",
-                        "dio",
-                        "dpo",
-                        "ccc",
-                        "alert_flag",
-                    ]
+                    page_no = int((query.get("page", ["1"])[0] or "1").strip())
+                    page_no = max(1, page_no)
+                    all_df = pd.read_csv(pbi_csv)
+                    per_page = 120
+                    start = (page_no - 1) * per_page
+                    end = start + per_page
+                    df = all_df.iloc[start:end].copy()
+                    preferred_cols = ["ticker", "period_key", "revenue", "net_profit", "revenue_mom_pct", "threshold_pct", "alert_flag"]
                     keep_cols = [c for c in preferred_cols if c in df.columns]
                     if keep_cols:
                         df = df[keep_cols]
-                    for col in ["revenue_mom_pct", "dso", "dio", "dpo", "ccc"]:
+                    for col in ["revenue_mom_pct", "threshold_pct"]:
                         if col in df.columns:
                             df[col] = pd.to_numeric(df[col], errors="coerce").round(4)
+
+                    next_link = f"<a href='/preview-powerbi?page={page_no + 1}'>下一页</a>" if end < len(all_df) else ""
+                    prev_link = f"<a href='/preview-powerbi?page={page_no - 1}'>上一页</a>" if page_no > 1 else ""
                     page = f"""
                     <html><head><meta charset='utf-8'><title>Power BI 数据预览</title>
                     <style>
@@ -515,6 +597,7 @@ class CommanderHandler(BaseHTTPRequestHandler):
                     </style></head><body>
                     <p><a href="/">返回旺财控制台</a></p>
                     <h2>KPI快照：{html.escape(str(pbi_csv.name))}</h2>
+                    <p>第 {page_no} 页，单页 {per_page} 行。{prev_link} {next_link}</p>
                     <div class='table-wrap'>{df.to_html(index=False, border=0)}</div>
                     </body></html>
                     """
@@ -523,11 +606,6 @@ class CommanderHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     self._send_html(f"<h3>预览失败：{html.escape(str(e))}</h3><p><a href='/'>返回</a></p>")
                     return
-            if pbi_pbids.exists():
-                self._send_html(
-                    f"<h3>未找到 pbi_dataset.csv，可在 Power BI 打开：{html.escape(str(pbi_pbids))}</h3><p><a href='/'>返回</a></p>"
-                )
-                return
             self._send_html("<h3>未找到可预览的 Power BI 数据文件。</h3><p><a href='/'>返回</a></p>")
             return
 
@@ -548,10 +626,49 @@ class CommanderHandler(BaseHTTPRequestHandler):
                 self._set_result("系统提示", "无效按钮操作，请刷新后重试。")
             else:
                 try:
-                    self._set_result(command, route_command(command))
+                    normalized_command = re.sub(r"^[0-9①②③④⑤⑥⑦⑧⑨⑩\.\s]+", "", command).strip()
+                    self._set_result(command, route_command(normalized_command))
                 except Exception as e:
                     self._set_result(command, f"执行失败：{e}")
             self._send_html(render_page())
+            return
+
+        if self.path == "/set-runtime-params":
+            form = parse_qs(body.decode("utf-8", errors="ignore"))
+            params = {
+                "last_year_avg_growth": (form.get("last_year_avg_growth", [""])[0] or "").strip(),
+                "expected_growth": (form.get("expected_growth", [""])[0] or "").strip(),
+                "budget_amount": (form.get("budget_amount", [""])[0] or "").strip(),
+                "threshold_val": (form.get("threshold_val", [""])[0] or "").strip(),
+                "weight_totalRevenue": (form.get("weight_totalRevenue", [""])[0] or "").strip(),
+                "weight_sellingGeneralAndAdministrative": (
+                    form.get("weight_sellingGeneralAndAdministrative", [""])[0] or ""
+                ).strip(),
+            }
+            merged = set_runtime_params(params)
+            self._set_result("动态预算参数", f"参数已更新：{merged}")
+            self._send_html(render_page())
+            return
+
+        if self.path == "/confirm-import":
+            _, msg = confirm_staged_import()
+            self._set_result("确认完成导入", msg)
+            self._send_html(render_page())
+            return
+
+        if self.path == "/api/v1/confirm_approval":
+            form = {}
+            try:
+                form = parse_qs(body.decode("utf-8", errors="ignore"))
+            except Exception:
+                form = {}
+            result = route_command("审批通过，更新看板")
+            self._set_result("API审批并触发计算", result)
+
+            if (form.get("redirect", [""])[0] or "") == "1":
+                self._redirect("/")
+                return
+            self._send_json({"ok": True, "message": result})
             return
 
         if self.path == "/cloud-ingest":
@@ -560,7 +677,7 @@ class CommanderHandler(BaseHTTPRequestHandler):
             if not txt:
                 self._set_result("云端取数", "请输入股票代码、ERP账套名称或API地址。")
             else:
-                ok, msg = cloud_ingest(txt)
+                _, msg = cloud_ingest(txt)
                 self._set_result("云端取数", msg)
             self._send_html(render_page())
             return
@@ -586,7 +703,6 @@ class CommanderHandler(BaseHTTPRequestHandler):
             saved = UPLOAD_DIR / safe_name
             saved.write_bytes(fobj["content"])
 
-            # 标准结构直接导入；非标准结构走启发式确认
             try:
                 if ext in [".xlsx", ".xls"]:
                     df = pd.read_excel(saved)
@@ -594,14 +710,6 @@ class CommanderHandler(BaseHTTPRequestHandler):
                     df = pd.read_csv(saved)
             except Exception as e:
                 self._set_result("本地表单导入", f"文件读取失败：{e}")
-                self._send_html(render_page())
-                return
-
-            cols = set([str(c) for c in df.columns])
-            if REQUIRED_IMPORT_COLS.issubset(cols):
-                ok, msg = import_csv_file(saved)
-                PENDING_CONFIRM = {}
-                self._set_result("本地表单导入", msg)
                 self._send_html(render_page())
                 return
 
@@ -613,6 +721,15 @@ class CommanderHandler(BaseHTTPRequestHandler):
                     if pd.to_numeric(df[c], errors="coerce").notna().sum() > 0:
                         sugg["amount"] = str(c)
                         break
+
+            has_core = bool(sugg.get("fiscal_date") and sugg.get("amount"))
+            if has_core:
+                std = standardize_with_mapping(df, sugg, default_ticker="MANUAL")
+                _, msg = stage_dataframe(std if not std.empty else df, source_name=f"Upload:{saved.name}")
+                self._set_result("本地表单导入", msg)
+                self._send_html(render_page())
+                return
+
             token = uuid.uuid4().hex
             pending_file = PENDING_DIR / f"pending_{token}.csv"
             df.to_csv(pending_file, index=False, encoding="utf-8-sig")
@@ -622,7 +739,7 @@ class CommanderHandler(BaseHTTPRequestHandler):
                 "columns": [str(c) for c in df.columns],
                 "suggestion": sugg,
             }
-            self._set_result("本地表单导入", "已进入智能识别确认，请在下方确认字段映射后导入。")
+            self._set_result("本地表单导入", "已进入智能识别确认，请在下方确认字段映射后加入暂存区。")
             self._send_html(render_page())
             return
 
@@ -671,11 +788,9 @@ class CommanderHandler(BaseHTTPRequestHandler):
                 self._send_html(render_page())
                 return
 
-            standardized_path = PENDING_DIR / f"standardized_{token}.csv"
-            std.to_csv(standardized_path, index=False, encoding="utf-8-sig")
-            ok, msg = import_csv_file(standardized_path)
+            _, msg = stage_dataframe(std, source_name=f"Mapped:{src.name}")
             PENDING_CONFIRM = {}
-            self._set_result("智能字段确认", msg if ok else msg)
+            self._set_result("智能字段确认", msg)
             self._send_html(render_page())
             return
 
